@@ -126,6 +126,23 @@ def test_hifi_tracks_low_fidelity(problem, hifi):
 
 def test_front_to_rear_is_stricter(hifi):
     strict = bocode.get_problem("YagiUda21_HiFi")(front_to_rear=True)
-    fb = hifi.simulate(X_REF)["front_to_back_db"]
-    fr = strict.simulate(X_REF)["front_to_back_db"]
-    assert fr <= fb + 1e-9
+    sim = strict.simulate(X_REF)
+    assert "front_to_rear_db" not in hifi.simulate(X_REF)
+    assert sim["front_to_back_db"] == pytest.approx(
+        hifi.simulate(X_REF)["front_to_back_db"]
+    )  # still the 180 deg value
+    assert sim["front_to_rear_db"] <= sim["front_to_back_db"] + 1e-9
+    _, g = strict.evaluate(torch.tensor([X_REF], dtype=torch.float64))
+    assert g[0, 1].item() == pytest.approx(15.0 - sim["front_to_rear_db"])
+
+
+def test_sample_gives_discrete_choices_equal_shares(problem):
+    X = problem.sample(8000, seed=0)
+    for d in (3.2, 4.8, 6.35, 9.5):
+        assert (X[:, 1] == d).double().mean().item() == pytest.approx(0.25, abs=0.01)
+    for k in range(1, 9):
+        assert (X[:, 0] == k).double().mean().item() == pytest.approx(0.125, abs=0.01)
+    assert torch.equal(problem.enforce_variable_types(X), X)  # already valid
+    b = torch.tensor(problem.bounds, dtype=torch.float64)
+    lo, hi = b[:, 0], b[:, 1]
+    assert ((X >= lo) & (X <= hi)).all()

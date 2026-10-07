@@ -220,9 +220,36 @@ class YagiUda21(BenchmarkProblem):
         gains = np.maximum(gains, _G_FLOOR_DBI)
         phi = np.arange(n_phi) * self._phi_step
         g_fwd = float(gains[0])
+        g_back = float(gains[np.isclose(phi, 180.0)][0])
         g_rear = float(gains[(phi >= 90.0) & (phi <= 270.0)].max())
-        fb = float(np.clip(g_fwd - g_rear, -_FB_CLIP_DB, _FB_CLIP_DB))
-        return g_fwd, gamma, fb
+        fb = float(np.clip(g_fwd - g_back, -_FB_CLIP_DB, _FB_CLIP_DB))  # 180 deg only
+        fr = float(np.clip(g_fwd - g_rear, -_FB_CLIP_DB, _FB_CLIP_DB))  # rear half
+        # the constrained pattern ratio: F/B by default, F/R when phi is finely sampled
+        ratio = fr if self.front_to_rear else fb
+        return g_fwd, gamma, ratio, fb, fr
+
+    @property
+    def front_to_rear(self) -> bool:
+        """True when the pattern constraint uses the front-to-rear ratio."""
+        return self._phi_step < 180.0
+
+    def sample(self, n: int, seed: int | None = None) -> torch.Tensor:
+        """Latin-hypercube initial design with uniform discrete choices.
+
+        The base class scales a continuous coordinate and snaps it to the nearest
+        allowed value, which gives the four tube diameters (unevenly spaced) and the
+        end values of ``n_dir`` unequal shares. Here each director count and each
+        diameter gets an equal share, while keeping the Latin-hypercube stratification.
+        """
+        from scipy.stats import qmc
+
+        u = qmc.LatinHypercube(d=self.dim, seed=seed).random(n)
+        X = self.scale(torch.from_numpy(u).to(torch.double))
+        n_dir = np.floor(u[:, 0] * _N_DIR_MAX) + 1
+        idx = np.minimum((u[:, 1] * len(_DIAMETERS_MM)).astype(int), 3)
+        X[:, 0] = torch.from_numpy(n_dir)
+        X[:, 1] = torch.tensor(_DIAMETERS_MM, dtype=torch.double)[idx]
+        return X
 
     def simulate(self, x) -> dict:
         """Full NEC2 result for one design (useful for inspection and plotting)."""
@@ -231,16 +258,19 @@ class YagiUda21(BenchmarkProblem):
         X = torch.as_tensor(np.asarray(x, dtype=np.float64).reshape(1, -1))
         x = self.enforce_variable_types(X)[0].numpy()  # same snapping as evaluate()
         lengths, positions, diam_mm, boom = self._decode(x)
-        g_fwd, gamma, fb = self._solve(lengths, positions, diam_mm)
+        g_fwd, gamma, _, fb, fr = self._solve(lengths, positions, diam_mm)
         vswr = (1 + gamma) / (1 - gamma) if gamma < 1 else float("inf")
-        return {
+        out = {
             "gain_dbi": g_fwd,
             "max_abs_gamma": float(gamma),
             "max_vswr": float(vswr),
-            "front_to_back_db": fb,
+            "front_to_back_db": fb,  # always the 180 deg ratio
             "boom_lambda": boom,
             "n_elements": len(lengths),
         }
+        if self.front_to_rear:
+            out["front_to_rear_db"] = fr  # worst lobe over the rear half plane
+        return out
 
     def _evaluate_implementation(self, X: torch.Tensor, scaling: bool = False):
         if scaling:
@@ -253,7 +283,7 @@ class YagiUda21(BenchmarkProblem):
         cons = np.empty((n, 3))
         for i in range(n):
             lengths, positions, diam_mm, boom = self._decode(x[i])
-            g_fwd, gamma, fb = self._solve(lengths, positions, diam_mm)
+            g_fwd, gamma, fb, _, _ = self._solve(lengths, positions, diam_mm)
             obj[i] = g_fwd
             cons[i] = (gamma - _GAMMA_MAX, _FB_MIN_DB - fb, boom - _BOOM_MAX)
 
